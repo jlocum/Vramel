@@ -9,13 +9,13 @@ dependencies {
     compile 'io.vertx:vertx-core:$vertxVersion'
 
     compile project(":vramel-core")
-    compile group: 'org.apache.camel', name: 'camel-core', version:'2.11.0'
-    compile group: 'org.apache.camel', name: 'camel-spring', version:'2.11.0'
-    compile group: 'org.apache.camel', name: 'camel-stream', version:'2.11.0'
-    compile (group: 'org.apache.camel', name: 'camel-hazelcast', version:'2.11.0') {
+    compile group: 'org.apache.camel', name: 'camel-core', version:'2.14.1'
+    compile group: 'org.apache.camel', name: 'camel-spring', version:'2.14.1'
+    compile group: 'org.apache.camel', name: 'camel-stream', version:'2.14.1'
+    compile (group: 'org.apache.camel', name: 'camel-hazelcast', version:'2.14.1') {
         exclude module: 'hazelcast'
     }
-    compile 'com.hazelcast:hazelcast:3.3.3'
+    compile (group: "com.hazelcast", name: "hazelcast", version: "3.3.3")
 
 }
 
