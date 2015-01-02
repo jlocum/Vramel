@@ -5,6 +5,7 @@ dependencies {
 
 
     compile project(":vramel-core")
+    compile project(":vertx-queue")
 }
 
 
