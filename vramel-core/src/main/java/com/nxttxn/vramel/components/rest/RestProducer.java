@@ -1,6 +1,7 @@
 package com.nxttxn.vramel.components.rest;
 
 import com.google.common.base.Optional;
+import com.google.common.collect.Maps;
 import com.nxttxn.vramel.ClientFactory;
 import com.nxttxn.vramel.Endpoint;
 import com.nxttxn.vramel.Exchange;
@@ -9,18 +10,21 @@ import com.nxttxn.vramel.impl.DefaultAsyncProducer;
 import com.nxttxn.vramel.impl.DefaultMessage;
 import com.nxttxn.vramel.impl.DefaultProducer;
 import com.nxttxn.vramel.processor.async.OptionalAsyncResultHandler;
+import com.nxttxn.vramel.spi.HeaderFilterStrategy;
 import com.nxttxn.vramel.util.AsyncProcessorHelper;
+import com.nxttxn.vramel.util.ObjectHelper;
 import org.vertx.java.core.Handler;
 import org.vertx.java.core.buffer.Buffer;
 import org.vertx.java.core.http.HttpClient;
 import org.vertx.java.core.http.HttpClientRequest;
 import org.vertx.java.core.http.HttpClientResponse;
+import org.vertx.java.core.http.HttpServerRequest;
 import org.vertx.java.core.json.JsonObject;
 import org.vertx.java.core.json.impl.Base64;
 
 import java.io.UnsupportedEncodingException;
 import java.net.URI;
-import java.util.Map;
+import java.util.*;
 
 /**
  * Created with IntelliJ IDEA.
@@ -64,6 +68,11 @@ public class RestProducer extends DefaultAsyncProducer {
     }
 
     @Override
+    public RestChannelAdapter getEndpoint() {
+        return endpoint;
+    }
+
+    @Override
     public boolean process(final Exchange exchange, final OptionalAsyncResultHandler optionalAsyncResultHandler) throws Exception {
         final Handler<Throwable> exceptionHandler = new Handler<Throwable>() {
             @Override
@@ -78,14 +87,19 @@ public class RestProducer extends DefaultAsyncProducer {
         HttpClientRequest request = httpClient.request(method, uri, new Handler<HttpClientResponse>() {
             @Override
             public void handle(final HttpClientResponse httpClientResponse) {
-                logger.info(String.format("[Rest Producer] [Reply] [%s - %s]: %s - %s", method, uri, httpClientResponse.statusCode(), httpClientResponse.statusMessage()));
+                final int responseCode = httpClientResponse.statusCode();
+                final String statusMessage = httpClientResponse.statusMessage();
+                logger.info(String.format("[Rest Producer] [Reply] [%s - %s]: %s - %s", method, uri, responseCode, statusMessage));
+
+
                 Message old = exchange.getIn();
 
                 // create a new message container so we do not drag specialized message objects along
                 final Message msg = new DefaultMessage();
                 msg.copyFrom(old);
 
-                for (Map.Entry<String, String> header : httpClientResponse.headers().entries()) {
+                final Map<String, String> headers = extractHeaders(httpClientResponse);
+                for (Map.Entry<String, String> header : headers.entrySet()) {
                     msg.setHeader(header.getKey(), header.getValue());
                 }
 
@@ -94,9 +108,24 @@ public class RestProducer extends DefaultAsyncProducer {
                     @Override
                     public void handle(Buffer buffer) {
 
-                        logger.debug(String.format("[Rest Producer] [Reply] [%s - %s]: Response: %s", method, uri, buffer.toString()));
+                        final String copy = buffer.toString();
+                        logger.debug(String.format("[Rest Producer] [Reply] [%s - %s]: Response: %s", method, uri, copy));
                         msg.setBody(buffer.getBytes());
                         exchange.setOut(msg);
+
+                        if (responseCode > 299) {
+                            RestOperationFailedException answer;
+                            String locationHeader = headers.get("location");
+                            if (locationHeader != null && (responseCode >= 300 && responseCode < 400)) {
+                                answer = new RestOperationFailedException(uri, responseCode, statusMessage, locationHeader, headers, copy);
+                            } else {
+                                answer = new RestOperationFailedException(uri, responseCode, statusMessage, null, headers, copy);
+                            }
+
+                            exchange.setException(answer);
+                        }
+
+
                         optionalAsyncResultHandler.done(exchange);
                     }
                 });
@@ -115,17 +144,51 @@ public class RestProducer extends DefaultAsyncProducer {
                     .putHeader("Accept", "*/*");
         }
 
-        for (Map.Entry<String, Object> header : message.getHeaders().entrySet()) {
-            request = request.putHeader(header.getKey(), (String) header.getValue());
+        final boolean emptyBody = buffer.length() == 0;
+
+        String contentType = message.getHeader(Exchange.CONTENT_TYPE, defaultContentType, String.class);
+        HeaderFilterStrategy strategy = getEndpoint().getHeaderFilterStrategy();
+
+        // propagate headers as HTTP headers
+        for (Map.Entry<String, Object> entry : message.getHeaders().entrySet()) {
+            String key = entry.getKey();
+            Object headerValue = message.getHeader(key);
+
+            if (headerValue != null) {
+                // use an iterator as there can be multiple values. (must not use a delimiter, and allow empty values)
+                final Iterator<?> it = ObjectHelper.createIterator(headerValue, null, true);
+
+                // the value to add as request header
+                final List<String> values = new ArrayList<String>();
+
+                // if its a multi value then check each value if we can add it and for multi values they
+                // should be combined into a single value
+                while (it.hasNext()) {
+                    String value = exchange.getContext().getTypeConverter().convertTo(String.class, it.next());
+
+                    if (value != null && strategy != null && !strategy.applyFilterToCamelHeaders(key, value, exchange)) {
+                        values.add(value);
+                    }
+                }
+
+                // add the value(s) as a http request header
+                if (values.size() > 0) {
+                    // use the default toString of a ArrayList to create in the form [xxx, yyy]
+                    // if multi valued, for a single value, then just output the value as is
+                    String s =  values.size() > 1 ? values.toString() : values.get(0);
+                    request = request.putHeader(key, s);
+                }
+            }
         }
 
-        if (buffer.length() == 0) {
+
+
+        request.putHeader("Accept-Encoding", "gzip, deflate"); //if clients require customization beyond this we'll need to tweak
+
+        if (emptyBody) {
             request.end();
         } else {
             // set the content type in the response.
-            String contentType = message.getHeader(Exchange.CONTENT_TYPE, defaultContentType, String.class);
-            message.removeHeader(Exchange.CONTENT_TYPE);
-
             request.putHeader("Content-Type", contentType)
                     .putHeader("Content-Length", String.valueOf(buffer.length()))
                     .end(buffer);
@@ -133,6 +196,13 @@ public class RestProducer extends DefaultAsyncProducer {
 
         return false;
 
+    }
+    private Map<String, String> extractHeaders(HttpClientResponse httpClientResponse) {
+        Map<String, String> headers = Maps.newHashMap();
+        for (Map.Entry<String, String> entry : httpClientResponse.headers()) {
+            headers.put(entry.getKey(), entry.getValue());
+        }
+        return headers;
     }
 
     public void process(Exchange exchange) throws Exception {
